@@ -1,1 +1,3 @@
-streamlitpandasemail-validator
+streamlit
+pandas
+email-validator
