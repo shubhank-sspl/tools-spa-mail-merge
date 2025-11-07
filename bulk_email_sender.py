@@ -15,9 +15,6 @@ from email_validator import validate_email, EmailNotValidError
 
 # --- 0. Initial Setup ---
 
-# Load environment variables from a .env file (for local development)
-load_dotenv()
-
 # Streamlit page configuration
 st.set_page_config(
     page_title="Customizable Mail Merge Sender",
