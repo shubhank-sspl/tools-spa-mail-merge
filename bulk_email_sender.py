@@ -11,7 +11,6 @@ import queue
 from threading import Thread
 from io import StringIO, BytesIO
 
-from dotenv import load_dotenv
 from email_validator import validate_email, EmailNotValidError
 
 # --- 0. Initial Setup ---
