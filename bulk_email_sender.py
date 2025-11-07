@@ -1,17 +1,14 @@
 import streamlit as st
 import pandas as pd
-import csv
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.header import Header
-import os
 import time
 import queue
 from threading import Thread
-from io import StringIO, BytesIO
-
-from email_validator import validate_email, EmailNotValidError
+from io import StringIO
+import re
 
 # --- 0. Initial Setup ---
 
@@ -25,10 +22,10 @@ st.set_page_config(
 # --- 1. Session State Management ---
 
 STEP_LABELS = [
-    "1️⃣ Data & Mapping", 
-    "2️⃣ Template Editor", 
-    "3️⃣ Record Preview", 
-    "4️⃣ SMTP & Test", 
+    "1️⃣ Data & Mapping",
+    "2️⃣ Template Editor",
+    "3️⃣ Record Preview",
+    "4️⃣ SMTP & Test",
     "5️⃣ Send & Status"
 ]
 MAX_STEPS = len(STEP_LABELS)
@@ -47,10 +44,10 @@ def initialize_session_state():
         'from_name': "Bulk Sender App",
         # --- SMTP Configuration Defaults ---
         'sender_email': "",
-        'sender_password': "", 
-        'smtp_server': "",   
+        'sender_password': "",
+        'smtp_server': "",
         'smtp_port': 587,
-        'smtp_test_passed': False, 
+        'smtp_test_passed': False,
         # -----------------------------------
         'workers': 3,
         'retries': 3,
@@ -59,8 +56,10 @@ def initialize_session_state():
         'column_mapping': {},
         'last_csv_name': None,
         'html_uploader_name': None,
+        'html_uploader': None,
+        'threads': [],
     }
-    
+
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -85,12 +84,13 @@ def go_prev():
 # --- 3. Core Logic Functions ---
 
 def is_valid_email(email):
-    """Validates the email address format."""
-    try:
-        validate_email(email, check_deliverability=False) 
-        return True
-    except EmailNotValidError:
+    """Lightweight email validation using regex to avoid external dependencies."""
+    if not isinstance(email, str) or not email:
         return False
+    email = email.strip()
+    # Basic RFC-like check (not exhaustive) that covers common valid addresses
+    pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+    return re.fullmatch(pattern, email) is not None
 
 def get_colored_dataframe(df):
     """Apply conditional coloring to the Status column."""
@@ -109,21 +109,26 @@ def get_colored_dataframe(df):
             color = 'lightblue'
         return f'background-color: {color}'
 
-    return df.style.applymap(color_status, subset=['Status'])
+    try:
+        return df.style.applymap(color_status, subset=['Status'])
+    except Exception:
+        # Fallback if styling fails for any reason
+        return df
 
 def update_status(index, status):
     """Safely update the status of a specific record in session state."""
     if st.session_state.df is not None:
         try:
             st.session_state.df.loc[index, 'Status'] = status
-        except KeyError:
+        except Exception:
+            # ignore any error updating status (index may not exist in df view)
             pass
 
 def apply_personalization(html_template, subject_line, record, mapping, recipient_col_name):
     """Applies the personalized data to the template and subject using the defined mapping."""
-    customized_html = html_template
-    customized_subject = subject_line
-    
+    customized_html = html_template or ""
+    customized_subject = subject_line or ""
+
     # 1. Apply Mapped Placeholders
     for placeholder_name, csv_column in mapping.items():
         placeholder = "{{" + placeholder_name + "}}"
@@ -132,14 +137,14 @@ def apply_personalization(html_template, subject_line, record, mapping, recipien
         customized_html = customized_html.replace(placeholder, str_value)
         customized_subject = customized_subject.replace(placeholder, str_value)
 
-    # 2. Also ensure the recipient column can be used as a fallback placeholder 
+    # 2. Also ensure the recipient column can be used as a fallback placeholder
     if recipient_col_name in record:
-         recipient_placeholder = "{{" + recipient_col_name + "}}"
-         recipient_value = record.get(recipient_col_name, "")
-         str_recipient_value = str(recipient_value) if pd.notna(recipient_value) else ""
-         customized_html = customized_html.replace(recipient_placeholder, str_recipient_value)
-         customized_subject = customized_subject.replace(recipient_placeholder, str_recipient_value)
-         
+        recipient_placeholder = "{{" + recipient_col_name + "}}"
+        recipient_value = record.get(recipient_col_name, "")
+        str_recipient_value = str(recipient_value) if pd.notna(recipient_value) else ""
+        customized_html = customized_html.replace(recipient_placeholder, str_recipient_value)
+        customized_subject = customized_subject.replace(recipient_placeholder, str_recipient_value)
+
     return customized_html, customized_subject
 
 
@@ -151,8 +156,10 @@ def send_email_worker(q, app_state):
         except queue.Empty:
             break
 
-        recipient_email = record.get(app_state['recipient_col'], "").strip()
-        
+        recipient_email = record.get(app_state['recipient_col'], "")
+        if isinstance(recipient_email, str):
+            recipient_email = recipient_email.strip()
+
         if not is_valid_email(recipient_email):
             update_status(record_index, "Invalid Email")
             q.task_done()
@@ -160,9 +167,9 @@ def send_email_worker(q, app_state):
 
         try:
             customized_html, customized_subject = apply_personalization(
-                app_state['html_template'], 
-                app_state['subject_line'], 
-                record, 
+                app_state['html_template'],
+                app_state['subject_line'],
+                record,
                 app_state['column_mapping'],
                 app_state['recipient_col']
             )
@@ -174,12 +181,12 @@ def send_email_worker(q, app_state):
             part1 = MIMEText(customized_html, "html", 'utf-8')
             msg.attach(part1)
 
-            retries = app_state['retries']
+            retries = int(app_state.get('retries', 0))
             delay = 5
-            
-            for attempt in range(retries):
+
+            for attempt in range(max(1, retries)):
                 try:
-                    with smtplib.SMTP(app_state['smtp_server'], app_state['smtp_port']) as server:
+                    with smtplib.SMTP(app_state['smtp_server'], int(app_state['smtp_port'])) as server:
                         server.starttls()
                         server.login(app_state['sender_email'], app_state['sender_password'])
                         server.sendmail(app_state['sender_email'], recipient_email, msg.as_string())
@@ -187,7 +194,7 @@ def send_email_worker(q, app_state):
                         break
                 except smtplib.SMTPAuthenticationError:
                     update_status(record_index, "Authentication Error")
-                    break 
+                    break
                 except Exception as e:
                     print(f"SMTP attempt {attempt + 1} failed for {recipient_email}. Error: {e}")
                     if attempt < retries - 1:
@@ -196,7 +203,7 @@ def send_email_worker(q, app_state):
                     else:
                         update_status(record_index, "Failed")
                         break
-        
+
         except Exception as e:
             print(f"Critical error processing record {record_index}: {e}")
             update_status(record_index, "Failed")
@@ -207,36 +214,36 @@ def send_email_worker(q, app_state):
 def test_smtp_connection():
     """Attempts to connect and log in to the configured SMTP server."""
     st.session_state.smtp_test_passed = False
-    
+
     if not all([st.session_state.sender_email, st.session_state.sender_password, st.session_state.smtp_server, st.session_state.smtp_port]):
         st.error("Please fill in all SMTP fields before testing.")
         return
 
     try:
         with st.spinner("Attempting to connect and authenticate..."):
-            with smtplib.SMTP(st.session_state.smtp_server, st.session_state.smtp_port, timeout=10) as server:
+            with smtplib.SMTP(st.session_state.smtp_server, int(st.session_state.smtp_port), timeout=10) as server:
                 server.starttls()
                 server.login(st.session_state.sender_email, st.session_state.sender_password)
                 st.session_state.smtp_test_passed = True
                 st.success("SMTP connection and authentication successful! You are ready to send.")
     except smtplib.SMTPAuthenticationError:
-        st.error("Authentication failed. Check your **Sender Email** and **App Password/Token**.")
+        st.error("Authentication failed. Check your Sender Email and App Password/Token.")
     except Exception as e:
         st.error(f"Connection Error: {e}. Check if the SMTP server address, port, and App Password are correct.")
-        
+
     if not st.session_state.smtp_test_passed:
         st.warning("Test failed. Please correct configuration before proceeding.")
 
 
 def load_html_file():
     """Loads and processes HTML template file from session state."""
-    html_file = st.session_state.html_uploader
-    
+    html_file = st.session_state.get('html_uploader')
+
     if html_file:
         try:
             st.session_state.html_template = html_file.getvalue().decode("utf-8")
-            st.session_state.html_uploader_name = html_file.name
-            st.success(f"HTML template '{html_file.name}' loaded successfully.")
+            st.session_state.html_uploader_name = getattr(html_file, "name", None)
+            st.success(f"HTML template '{st.session_state.html_uploader_name}' loaded successfully.")
         except Exception as e:
             st.error(f"Error reading HTML file: {e}")
             st.session_state.html_template = None
@@ -246,23 +253,23 @@ def load_html_file():
 
 def load_data_source(csv_file_data, email_list_text):
     """Determines data source (CSV or text list) and populates st.session_state.df."""
-    
-    new_csv_uploaded = csv_file_data and (st.session_state.df is None or csv_file_data.name != st.session_state.get('last_csv_name'))
+
+    new_csv_uploaded = csv_file_data and (st.session_state.df is None or getattr(csv_file_data, "name", None) != st.session_state.get('last_csv_name'))
 
     if csv_file_data:
         try:
             csv_data = StringIO(csv_file_data.getvalue().decode("utf-8"))
             df = pd.read_csv(csv_data).fillna('')
-            
+
             if new_csv_uploaded:
                 st.session_state.recipient_col = None
-                st.session_state.column_mapping = {} 
+                st.session_state.column_mapping = {}
                 st.session_state.last_csv_name = csv_file_data.name
 
             if 'Status' not in df.columns:
                 df['Status'] = 'Pending'
             df['Record ID'] = df.index
-            
+
             st.session_state.df = df
             return
 
@@ -272,9 +279,9 @@ def load_data_source(csv_file_data, email_list_text):
             st.session_state.column_mapping = {}
             return
 
-    elif email_list_text.strip():
+    elif email_list_text and email_list_text.strip():
         emails = [e.strip() for e in email_list_text.split(',') if e.strip()]
-        
+
         if not emails:
             st.session_state.df = None
             st.session_state.column_mapping = {}
@@ -291,7 +298,7 @@ def load_data_source(csv_file_data, email_list_text):
         df = pd.DataFrame(valid_emails_only, columns=[recipient_col_name])
         df['Status'] = 'Pending'
         df['Record ID'] = df.index
-        
+
         st.session_state.df = df
         st.session_state.recipient_col = recipient_col_name
         st.session_state.column_mapping = {recipient_col_name: recipient_col_name}
@@ -304,16 +311,16 @@ def load_data_source(csv_file_data, email_list_text):
 def start_sending():
     """Starts the email sending process in a background thread."""
     df = st.session_state.df
-    
+
     if not all([df is not None, st.session_state.html_template, st.session_state.recipient_col, st.session_state.smtp_test_passed]):
         st.error("Please complete all previous steps (Data, Template, and SMTP Test) before starting the send job.")
         return
-        
+
     st.session_state.job_queue = queue.Queue()
     st.session_state.is_sending = True
     st.session_state.threads = []
 
-    pending_df = df[df['Status'] != 'Sent'].copy() 
+    pending_df = df[df['Status'] != 'Sent'].copy()
 
     if pending_df.empty:
         st.warning("No pending emails found.")
@@ -323,27 +330,27 @@ def start_sending():
     for index, row in pending_df.iterrows():
         update_status(index, "Queued")
         st.session_state.job_queue.put((index, row.to_dict()))
-        
+
     st.info(f"Starting {st.session_state.job_queue.qsize()} emails with {st.session_state.workers} workers...")
-    
-    for i in range(st.session_state.workers):
+
+    for i in range(max(1, int(st.session_state.workers))):
         worker = Thread(target=send_email_worker, args=(st.session_state.job_queue, st.session_state), daemon=True)
         worker.start()
         st.session_state.threads.append(worker)
 
 def check_sending_status():
     """Checks the queue and updates the UI (called periodically)."""
-    
+
     total_records = len(st.session_state.df)
     completed_statuses = ['Sent', 'Failed', 'Invalid Email', 'Authentication Error']
     completed_count = st.session_state.df['Status'].isin(completed_statuses).sum()
 
-    if completed_count == total_records or st.session_state.job_queue.empty() and not any(t.is_alive() for t in st.session_state.threads):
+    if (completed_count == total_records) or (st.session_state.job_queue.empty() and not any(t.is_alive() for t in st.session_state.threads)):
         if st.session_state.is_sending: # Only show success message if it was actively sending
             st.session_state.is_sending = False
             st.success("Email sending job finished!")
             st.rerun()
-        
+
     return completed_count, total_records
 
 def get_available_csv_columns(df, recipient_col):
@@ -398,9 +405,9 @@ st.markdown("""
 
 current_step_label = STEP_LABELS[st.session_state.step_index]
 st.radio(
-    "Navigation", 
-    options=STEP_LABELS, 
-    index=st.session_state.step_index, 
+    "Navigation",
+    options=STEP_LABELS,
+    index=st.session_state.step_index,
     key="step_radio",
     label_visibility="collapsed"
 )
@@ -413,65 +420,65 @@ st.markdown("---")
 # --- Step 1: Data & Mapping (Index 0) ---
 if st.session_state.step_index == 0:
     st.header("Upload Data and Configure Merge Fields")
-    
+
     csv_file = st.file_uploader("Upload CSV Data File (Optional)", type=['csv'], key="csv_uploader")
-    
+
     st.session_state.email_list_input = st.text_area(
-        "OR Enter Comma-Separated Email IDs (e.g., a@a.com, b@b.com)", 
-        value=st.session_state.email_list_input, 
-        height=100, 
+        "OR Enter Comma-Separated Email IDs (e.g., a@a.com, b@b.com)",
+        value=st.session_state.email_list_input,
+        height=100,
         key="email_list_text_input"
     )
-    
+
     load_data_source(csv_file, st.session_state.email_list_input)
-    
+
     if st.session_state.df is not None:
         st.success(f"Data loaded successfully. Found **{len(st.session_state.df)}** records.")
         st.subheader("Campaign Details & Mapping")
-        
+
         col_options = st.session_state.df.columns.tolist()
-        
+
         default_index = col_options.index(st.session_state.recipient_col) + 1 if st.session_state.recipient_col in col_options else 0
-        
+
         st.session_state.recipient_col = st.selectbox(
-            "1. Select Recipient Email Column (Mandatory)", 
-            options=[None] + col_options, 
+            "1. Select Recipient Email Column (Mandatory)",
+            options=[None] + col_options,
             index=default_index,
             key="recipient_column_select"
         )
-        
+
         st.session_state.from_name = st.text_input("2. Sender Display Name", value=st.session_state.from_name)
         st.session_state.subject_line = st.text_input("3. Email Subject Line (Use Mapped Variables)", value=st.session_state.subject_line)
-        
+
         available_cols = get_available_csv_columns(st.session_state.df, st.session_state.recipient_col)
-        
+
         if st.session_state.recipient_col and available_cols:
             st.subheader("4. Variable Mapping")
             st.markdown("Define short names for your CSV columns to use as placeholders (e.g., `{{Name}}`).")
-            
+
             new_mapping = st.session_state.column_mapping.copy()
             col_map, col_placeholder = st.columns([1, 1])
             col_map.markdown("**:blue[CSV Column Name]**")
             col_placeholder.markdown("**:blue[Template Variable (e.g., `Name`)]**")
-            
-            with st.container(border=True):
+
+            with st.container():
                 for csv_col in available_cols:
                     placeholder_key = f"placeholder_map_{csv_col}"
-                    
+
                     initial_placeholder = ""
                     for p_name, c_name in st.session_state.column_mapping.items():
                         if c_name == csv_col:
                             initial_placeholder = p_name
                             break
-                    
+
                     if not initial_placeholder:
                         initial_placeholder = csv_col.replace(' ', '_').replace('-', '_').strip()
-                        
+
                     c1, c2 = st.columns([1, 1])
                     c1.text_input(csv_col, value=csv_col, disabled=True, label_visibility="collapsed", key=f"csv_{csv_col}")
-                    
+
                     user_input = c2.text_input("Placeholder Name", value=initial_placeholder, key=placeholder_key, label_visibility="collapsed")
-                    
+
                     if user_input.strip():
                         new_mapping[user_input.strip()] = csv_col
                     else:
@@ -480,12 +487,12 @@ if st.session_state.step_index == 0:
                             del new_mapping[k]
 
             st.session_state.column_mapping = new_mapping
-            
+
             # Placeholders for display are generated here
             placeholders = [f"{{{{{p}}}}}" for p in st.session_state.column_mapping.keys()]
             if st.session_state.recipient_col:
                 placeholders.append(f"{{{{{st.session_state.recipient_col}}}}}")
-                
+
             st.info(f"Available Placeholders for Template: {', '.join(placeholders)}")
 
     else:
@@ -494,21 +501,21 @@ if st.session_state.step_index == 0:
 # --- Step 2: Template Editor (Index 1) ---
 elif st.session_state.step_index == 1:
     st.header("Upload and Edit HTML Template")
-    
+
     # Check if data is ready for template mapping
     is_data_ready = st.session_state.df is not None and st.session_state.recipient_col is not None
-    
+
     html_file = st.file_uploader(
-        "Upload HTML Template File", 
-        type=['html'], 
+        "Upload HTML Template File",
+        type=['html'],
         on_change=load_html_file,
         key="html_uploader"
     )
 
     if st.session_state.html_template:
-        
+
         col_editor, col_placeholders = st.columns([3, 1])
-        
+
         with col_editor:
             st.subheader("Template Editor")
             st.caption(f"Editing content from: **{st.session_state.get('html_uploader_name', 'Manual Input')}**")
@@ -518,78 +525,85 @@ elif st.session_state.step_index == 1:
                 height=300,
                 key="template_editor_area"
             )
-            
+
         with col_placeholders:
             st.subheader("Placeholders")
             if is_data_ready:
-                
+
                 # Re-generate placeholders list based on mapping
                 placeholders = [f"{{{{{p}}}}}" for p in st.session_state.column_mapping.keys()]
                 if st.session_state.recipient_col:
                     placeholders.append(f"{{{{{st.session_state.recipient_col}}}}}")
-                
+
                 # Display placeholders list for easy copying
                 st.markdown('<div class="placeholder-list">', unsafe_allow_html=True)
                 st.markdown("**Copy and paste into your HTML:**")
                 for p in placeholders:
                     st.markdown(f'<div class="placeholder-item">{p}</div>', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
-                
+
             else:
                 st.warning("Complete **Step 1** to define placeholders.")
 
         st.markdown("---")
         st.subheader("Live Template Preview (Un-personalized)")
-        st.html(st.session_state.html_template)
+        # Use Streamlit's html renderer
+        try:
+            st.components.v1.html(st.session_state.html_template, height=400, scrolling=True)
+        except Exception:
+            # Fallback to raw HTML rendering if components not available
+            st.write("HTML preview not available in this Streamlit runtime.")
     else:
         st.warning("Please upload an HTML file to proceed to the next step.")
 
 # --- Step 3: Record Preview (Index 2) ---
 elif st.session_state.step_index == 2:
     st.header("Personalized Email Preview")
-    
+
     if st.session_state.df is not None and st.session_state.html_template is not None and st.session_state.recipient_col:
         st.markdown("Select a **Record ID** from the table to see exactly how the email will look for that recipient.")
-        
+
         max_index = len(st.session_state.df) - 1
-        
+
         # Display Data for reference
         st.subheader("Data Records")
-        st.dataframe(st.session_state.df[['Record ID'] + [col for col in st.session_state.df.columns if col not in ['Status', 'Record ID']]], 
-                     use_container_width=True, hide_index=True)
+        display_cols = ['Record ID'] + [col for col in st.session_state.df.columns if col not in ['Status', 'Record ID']]
+        st.dataframe(st.session_state.df[display_cols], use_container_width=True, hide_index=True)
 
         st.subheader("Preview Generator")
-        
+
         col_index, col_button = st.columns([1, 2])
-        
+
         with col_index:
             preview_row_idx = st.number_input(
-                "Enter Record ID to Preview (0 to Max)", 
-                min_value=0, 
-                max_value=max_index, 
-                step=1, 
+                "Enter Record ID to Preview (0 to Max)",
+                min_value=0,
+                max_value=max_index,
+                step=1,
                 key="preview_index",
                 help="The Record ID corresponds to the index in the table above."
             )
-        
+
         with col_button:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Generate Personalized Preview", use_container_width=True):
                 try:
-                    record_to_preview = st.session_state.df.iloc[preview_row_idx].to_dict()
-                    
+                    record_to_preview = st.session_state.df.iloc[int(preview_row_idx)].to_dict()
+
                     preview_html, preview_subject = apply_personalization(
-                        st.session_state.html_template, 
-                        st.session_state.subject_line, 
-                        record_to_preview, 
+                        st.session_state.html_template,
+                        st.session_state.subject_line,
+                        record_to_preview,
                         st.session_state.column_mapping,
                         st.session_state.recipient_col
                     )
-                        
+
                     st.success(f"Preview for **{record_to_preview.get(st.session_state.recipient_col, 'Record')}**")
                     st.info(f"**Final Subject:** {preview_subject}")
-                    st.html(preview_html)
-                    
+                    try:
+                        st.components.v1.html(preview_html, height=400, scrolling=True)
+                    except Exception:
+                        st.write(preview_html)
                 except IndexError:
                     st.error("Invalid Record ID. Please enter a number within the range.")
                 except Exception as e:
@@ -600,27 +614,33 @@ elif st.session_state.step_index == 2:
 # --- Step 4: SMTP Configuration & Test (Index 3) ---
 elif st.session_state.step_index == 3:
     st.header("SMTP Server Configuration & Test")
-    st.markdown("Enter your server details. You **must** use an App Password or Token if required by your email provider.")
-    
+    st.markdown("Enter your server details. You must use an App Password or Token if required by your email provider.")
+
     col_smtp_1, col_smtp_2 = st.columns(2)
-    
+
     with col_smtp_1:
         st.session_state.sender_email = st.text_input("Sender Email (From)", value=st.session_state.sender_email, key="smtp_sender_email")
         st.session_state.smtp_server = st.text_input("SMTP Server", value=st.session_state.smtp_server, key="smtp_server_input", help="e.g., smtp.gmail.com")
     with col_smtp_2:
-        st.session_state.sender_password = st.text_input("App Password / Token", value=st.session_state.sender_password, type="password", key="smtp_sender_password", help="Use a generated App Password for services like Gmail.")
-        st.session_state.smtp_port = st.number_input("SMTP Port (usually 587 or 465)", value=st.session_state.smtp_port, min_value=1, max_value=65535, step=1, key="smtp_port_input")
-        
+        st.session_state.sender_password = st.text_input(
+            "App Password / Token",
+            value=st.session_state.sender_password,
+            type="password",
+            key="smtp_sender_password",
+            help="Use a generated App Password/Token from your provider (e.g., Gmail App Password) if required."
+        )
+        st.session_state.smtp_port = st.number_input("SMTP Port (usually 587 or 465)", value=int(st.session_state.smtp_port), min_value=1, max_value=65535, step=1, key="smtp_port_input")
+
     st.subheader("Sending Parameters")
     col_adv_1, col_adv_2 = st.columns(2)
     with col_adv_1:
-        st.session_state.workers = st.slider("Concurrent Workers (Threads)", 1, 10, st.session_state.workers, key="workers_slider", help="More workers speed up the job but may cause rate limiting issues.")
+        st.session_state.workers = st.slider("Concurrent Workers (Threads)", 1, 10, int(st.session_state.workers), key="workers_slider", help="More workers speed up the job but may cause rate limiting issues with some providers.")
     with col_adv_2:
-        st.session_state.retries = st.slider("Email Retries on Failure", 0, 5, st.session_state.retries, key="retries_slider", help="Number of times to retry a failed email.")
+        st.session_state.retries = st.slider("Email Retries on Failure", 0, 5, int(st.session_state.retries), key="retries_slider", help="Number of times to retry a failed email.")
 
     st.markdown("---")
     st.subheader("Test Connection")
-    
+
     if st.session_state.smtp_test_passed:
         st.success("✅ SMTP Test Passed: Credentials confirmed.")
     else:
@@ -631,22 +651,21 @@ elif st.session_state.step_index == 3:
 # --- Step 5: Send & Status (Index 4) ---
 elif st.session_state.step_index == 4:
     st.header("Start Sending and Track Status")
-    
+
     if st.session_state.df is not None:
-        
+
         # Readiness Checks
         is_ready = st.session_state.smtp_test_passed and st.session_state.html_template is not None and st.session_state.recipient_col is not None
 
         if not is_ready:
-            st.error("🚨 Configuration incomplete. Ensure **Data, Template, and SMTP Test (Step 4)** are successful.")
+            st.error("🚨 Configuration incomplete. Ensure Data, Template, and SMTP Test (Step 4) are successful.")
         else:
             st.success("✅ All checks passed! The application is ready to start the bulk send job.")
 
-        
         send_disabled = not is_ready or st.session_state.is_sending
 
         st.button("🚀 Start Bulk Send", on_click=start_sending, type="primary", use_container_width=True, disabled=send_disabled)
-        
+
         st.markdown("---")
         st.subheader("Current Data Status")
 
@@ -654,16 +673,22 @@ elif st.session_state.step_index == 4:
         if st.session_state.is_sending:
             completed, total = check_sending_status()
             progress_percent = completed / total if total > 0 else 0
-            
-            st.progress(progress_percent, text=f"Processing: {completed}/{total} ({progress_percent*100:.1f}%)")
+
+            # st.progress expects a float between 0.0 and 1.0
+            try:
+                st.progress(progress_percent)
+                st.write(f"Processing: {completed}/{total} ({progress_percent*100:.1f}%)")
+            except Exception:
+                st.write(f"Processing: {completed}/{total} ({progress_percent*100:.1f}%)")
+
             st.warning("Sending in progress. Do not refresh the page until complete.")
-            
+
             # Display and constantly update the dataframe via st.rerun
             st.dataframe(get_colored_dataframe(st.session_state.df), use_container_width=True, hide_index=True)
-            
+
             time.sleep(1)
             st.rerun()
-            
+
         else:
             # Final Status Table
             if st.session_state.df is not None:
